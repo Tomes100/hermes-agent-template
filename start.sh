@@ -26,13 +26,17 @@ if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; t
   chmod 600 /data/.hermes/auth.json
 fi
 
-# Clear any stale gateway PID file left over from the previous container.
-# `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
-# remove it on SIGTERM. Since /data is a persistent volume, the file
-# survives container restarts and causes every subsequent boot to exit with
-# "ERROR gateway.run: PID file race lost to another gateway instance".
-# No hermes process can be running at this point (we're pre-exec in a fresh
-# container), so removing the file unconditionally is safe.
-rm -f /data/.hermes/gateway.pid
+# Clear stale gateway lock files left over from the previous container.
+# Hermes writes two files on gateway start and does not remove them on SIGTERM:
+#   gateway.pid  - PID record
+#   gateway.lock - OS flock() lock used as the primary "running" guard
+# Both live under /data (persistent volume) so they survive container restarts.
+# gateway.pid caused "PID file race" errors; gateway.lock (added in recent hermes
+# versions) causes "Gateway already running (PID X)" on every boot. During a
+# Railway rolling deploy the old container can still hold the flock on gateway.lock
+# while the new container tries to start, triggering the same error.
+# Removing both unconditionally is safe: we are pre-exec in a fresh container and
+# no hermes process from this container can be running yet.
+rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock
 
 exec python /app/server.py
