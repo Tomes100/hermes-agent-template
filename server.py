@@ -855,12 +855,11 @@ class Dashboard:
                 # hermes to trust that dist and skip its npm build check,
                 # which would otherwise add ~30s to first startup (hermes >= v2026.5.16).
                 "--skip-build",
-                # --tui exposes /api/pty + /api/ws + /api/events so the
-                # dashboard's embedded Chat tab works end-to-end. Requires
-                # hermes >= v2026.4.23 — older releases exit immediately
-                # with "unrecognized arguments: --tui". The Dockerfile
-                # pre-builds ui-tui/dist/ so PTY spawn is instant.
-                "--tui",
+                # v2026.6.5 removed the dashboard-level --tui flag: the
+                # embedded Chat tab and its /api/pty + /api/ws + /api/events
+                # sockets are now always enabled by `hermes dashboard`.
+                # Passing --tui here makes argparse exit before the server
+                # binds, leaving the Railway proxy with no dashboard.
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

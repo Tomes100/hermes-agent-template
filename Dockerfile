@@ -8,7 +8,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.5.29.2
+ARG HERMES_REF=v2026.6.5
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -30,7 +30,7 @@ RUN apt-get update && \
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 #
-# [all] in v2026.5.29.2: cron, cli, dev, pty, mcp, homeassistant, sms, acp,
+# [all] in v2026.6.5: cron, cli, pty, mcp, homeassistant, sms, acp,
 # google, web, youtube. Messaging platforms, TTS, and other heavy backends
 # are now lazy-installed by hermes at first use. We pre-install the ones
 # this template actually uses so first-message latency is instant.
@@ -78,6 +78,12 @@ ENV HERMES_HOME=/data/.hermes
 # and avoids the 30-60s npm bootstrap that git-editable installs would otherwise
 # trigger on first /chat connection.
 ENV HERMES_TUI_DIR=/opt/hermes-agent/ui-tui
+
+# Make the pre-built Vite dashboard dist explicit. `hermes dashboard --skip-build`
+# defaults to PROJECT_ROOT/hermes_cli/web_dist for editable installs, but the env
+# override is the supported packaged path and protects this template if Hermes'
+# project-root detection changes again.
+ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 
 # tini wraps start.sh so it runs as PID 1's child instead of as PID 1 itself.
 # `-g` propagates signals to the whole process group so `docker stop` /
