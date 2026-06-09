@@ -17,6 +17,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 - **Live Status** — stat cards for gateway state, uptime, model, and pending pairing requests
 - **Live Logs** — streaming gateway log viewer
 - **User Pairing** — approve or deny users who message your bot, revoke access anytime
+- **Telegram Webhook Mode on Railway** — Telegram pushes messages to `/telegram`, so Railway can sleep between messages instead of running a polling bot all day
 - **Basic Auth** — password-protected admin panel
 - **Reset Config** — one-click reset to start fresh
 
@@ -50,6 +51,8 @@ Hermes Agent interacts entirely through messaging channels — there is no chat 
 
 1. **LLM Provider** — select OpenRouter from the dropdown, paste your API key, enter the model name
 2. **Messaging Channel** — check Telegram, paste the Bot Token from BotFather
+   - On Railway, the template fills the Telegram webhook URL automatically as `https://<your Railway domain>/telegram` and generates the required webhook secret.
+   - You can override `TELEGRAM_WEBHOOK_URL` manually if you use a custom domain.
 3. Click **Save & Start** — the gateway will start and your bot goes live
 
 ### 5. Start Chatting
@@ -66,8 +69,24 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `PORT` | `8080` | Web server port (set automatically by Railway) |
 | `ADMIN_USERNAME` | `admin` | Basic auth username |
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
+| `TELEGRAM_WEBHOOK_URL` | *(auto-filled on Railway)* | Public Telegram webhook endpoint, usually `https://<your Railway domain>/telegram` |
+| `TELEGRAM_WEBHOOK_SECRET` | *(auto-generated)* | Secret token Telegram echoes on webhook calls; required by Hermes webhook mode |
+| `TELEGRAM_WEBHOOK_PORT` | `8443` | Internal Hermes webhook listener port; the template proxies public `/telegram` traffic to it |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
+
+## Telegram on Railway: Webhook by Default
+
+Hermes normally uses Telegram long polling when `TELEGRAM_WEBHOOK_URL` is unset. Long polling is fine locally, but it keeps cloud services awake because the bot is always making outbound requests to Telegram.
+
+This Railway template defaults Telegram to webhook mode once a Telegram bot token is saved:
+
+- `TELEGRAM_WEBHOOK_URL` is set to `https://<your Railway domain>/telegram`
+- `TELEGRAM_WEBHOOK_SECRET` is generated if left blank
+- `TELEGRAM_WEBHOOK_PORT` defaults to `8443`
+- public `/telegram` traffic is forwarded by the admin server to Hermes' local webhook listener
+
+That lets Telegram wake the Railway service with inbound HTTPS traffic, which is the mode needed for sleep-when-idle deployments. If you clear `TELEGRAM_WEBHOOK_URL`, Hermes falls back to polling.
 
 ## Supported Providers
 
@@ -88,8 +107,10 @@ Railway Container
 ├── Python Admin Server (Starlette + Uvicorn)
 │   ├── /            — Admin dashboard (Basic Auth)
 │   ├── /health      — Health check (no auth)
+│   ├── /telegram    — Public Telegram webhook proxy (no dashboard auth)
 │   └── /api/*       — Config, status, logs, gateway, pairing
 └── hermes gateway   — Managed as async subprocess
+    └── :8443        — Local Telegram webhook listener when enabled
 ```
 
 The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.

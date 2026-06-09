@@ -67,6 +67,12 @@ HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 
+# Telegram webhook mode — Hermes listens on this internal port when
+# TELEGRAM_WEBHOOK_URL is set. Railway exposes only this admin server publicly,
+# so /telegram is forwarded to the gateway's local webhook listener below.
+TELEGRAM_WEBHOOK_HOST = "127.0.0.1"
+TELEGRAM_WEBHOOK_DEFAULT_PORT = 8443
+
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
 # else — notably `authorization`, because the SPA uses Bearer tokens against
@@ -134,6 +140,9 @@ ENV_VARS = [
     ("HONCHO_API_KEY",           "Honcho (memory)",          "tool",      True),
     ("TELEGRAM_BOT_TOKEN",       "Bot Token",                "telegram",  True),
     ("TELEGRAM_ALLOWED_USERS",   "Allowed User IDs",         "telegram",  False),
+    ("TELEGRAM_WEBHOOK_URL",     "Webhook URL",              "telegram",  False),
+    ("TELEGRAM_WEBHOOK_SECRET",  "Webhook secret",           "telegram",  True),
+    ("TELEGRAM_WEBHOOK_PORT",    "Webhook port",             "telegram",  False),
     ("DISCORD_BOT_TOKEN",        "Bot Token",                "discord",   True),
     ("DISCORD_ALLOWED_USERS",    "Allowed User IDs",         "discord",   False),
     ("SLACK_BOT_TOKEN",          "Bot Token (xoxb-...)",     "slack",     True),
@@ -181,6 +190,74 @@ def read_env(path: Path) -> dict[str, str]:
             v = v[1:-1]
         out[k.strip()] = v
     return out
+
+
+def _railway_public_base_url() -> str:
+    """Return this Railway service's public HTTPS base URL, if Railway exposed it."""
+    for key in ("RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL"):
+        value = os.environ.get(key, "").strip().rstrip("/")
+        if not value:
+            continue
+        if value.startswith(("http://", "https://")):
+            return value
+        return f"https://{value}"
+    return ""
+
+
+def _telegram_webhook_port(data: dict[str, str] | None = None) -> int:
+    raw = ""
+    if data:
+        raw = data.get("TELEGRAM_WEBHOOK_PORT", "")
+    raw = raw or os.environ.get("TELEGRAM_WEBHOOK_PORT", "") or str(TELEGRAM_WEBHOOK_DEFAULT_PORT)
+    try:
+        port = int(raw)
+        return port if 0 < port < 65536 else TELEGRAM_WEBHOOK_DEFAULT_PORT
+    except (TypeError, ValueError):
+        return TELEGRAM_WEBHOOK_DEFAULT_PORT
+
+
+def _request_public_base_url(request: Request) -> str:
+    """Best-effort public base URL from Railway/proxy request headers."""
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    host = host.strip().rstrip("/")
+    if not host:
+        return ""
+    hostname = host.rsplit(":", 1)[0]
+    if host in {"::1", "[::1]"} or hostname in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return ""
+    proto = request.headers.get("x-forwarded-proto", "https").split(",", 1)[0].strip() or "https"
+    # Railway public traffic is HTTPS. If the app sees plain HTTP internally,
+    # prefer HTTPS so Telegram accepts the generated webhook URL.
+    if proto == "http":
+        proto = "https"
+    return f"{proto}://{host}"
+
+
+def apply_telegram_webhook_defaults(data: dict[str, str], public_base_url: str = "") -> dict[str, str]:
+    """Default Telegram to webhook mode on Railway.
+
+    Hermes itself switches from polling to webhook mode whenever
+    TELEGRAM_WEBHOOK_URL is present. For this Railway template, the user already
+    entered a bot token in the setup UI, so we can safely fill the Railway public
+    URL, generate the required secret, and keep the local webhook listener on the
+    standard 8443 port. If no Railway public domain is available, leave polling
+    behavior untouched for local/manual runs.
+    """
+    if not data.get("TELEGRAM_BOT_TOKEN", "").strip():
+        return data
+
+    if not data.get("TELEGRAM_WEBHOOK_URL", "").strip():
+        base_url = (public_base_url or _railway_public_base_url()).rstrip("/")
+        if base_url:
+            data["TELEGRAM_WEBHOOK_URL"] = f"{base_url}/telegram"
+
+    if data.get("TELEGRAM_WEBHOOK_URL", "").strip():
+        if not data.get("TELEGRAM_WEBHOOK_SECRET", "").strip():
+            data["TELEGRAM_WEBHOOK_SECRET"] = secrets.token_hex(32)
+        if not data.get("TELEGRAM_WEBHOOK_PORT", "").strip():
+            data["TELEGRAM_WEBHOOK_PORT"] = str(TELEGRAM_WEBHOOK_DEFAULT_PORT)
+
+    return data
 
 
 def write_config_yaml(data: dict[str, str]) -> None:
@@ -761,12 +838,16 @@ class Gateway:
             # We build the env this way so hermes's own dotenv loading
             # (which reads the same file) doesn't shadow our values.
             env = {**os.environ, "HERMES_HOME": HERMES_HOME}
-            env.update(read_env(ENV_FILE))
+            file_env = read_env(ENV_FILE)
+            merged_env = apply_telegram_webhook_defaults(dict(file_env))
+            if merged_env != file_env:
+                write_env(ENV_FILE, merged_env)
+            env.update(merged_env)
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            write_config_yaml(merged_env)
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
                 stdout=asyncio.subprocess.PIPE,
@@ -946,6 +1027,7 @@ async def api_config_put(request: Request):
             for k, v in existing.items():
                 if k not in merged:
                     merged[k] = v
+            merged = apply_telegram_webhook_defaults(merged, _request_public_base_url(request))
             write_env(ENV_FILE, merged)
             write_config_yaml(merged)
         if restart:
@@ -1145,6 +1227,51 @@ It may still be starting up, or it may have crashed.</p>
 </div>
 <script>setTimeout(()=>location.reload(),4000);</script>
 </body></html>""" % HERMES_DASHBOARD_PORT
+
+
+async def route_telegram_webhook(request: Request) -> Response:
+    """Public Telegram webhook ingress.
+
+    Railway sends public HTTPS traffic to this admin server's $PORT. Hermes'
+    Telegram adapter, however, listens on TELEGRAM_WEBHOOK_PORT (8443 by
+    default) when webhook mode is enabled. Forward /telegram without cookie auth
+    so Telegram can deliver updates, while Hermes still verifies
+    X-Telegram-Bot-Api-Secret-Token against TELEGRAM_WEBHOOK_SECRET.
+    """
+    env = read_env(ENV_FILE)
+    port = _telegram_webhook_port(env)
+    target = f"http://{TELEGRAM_WEBHOOK_HOST}:{port}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    body = await request.body()
+    try:
+        upstream = await get_http_client().request(
+            request.method,
+            target,
+            headers=req_headers,
+            content=body,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return Response("Telegram webhook listener is not ready", status_code=503, media_type="text/plain")
+    except httpx.RequestError as e:
+        print(f"[telegram-webhook] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+        return Response("Telegram webhook proxy error", status_code=502, media_type="text/plain")
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+        and k.lower() not in ("content-encoding", "content-length")
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
 
 
 async def _proxy_to_dashboard(request: Request) -> Response:
@@ -1426,6 +1553,7 @@ ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
+    Route("/telegram",                          route_telegram_webhook, methods=ANY_METHOD),
     Route("/login",                             page_login,          methods=["GET"]),
     Route("/login",                             login_post,          methods=["POST"]),
     Route("/logout",                            logout),

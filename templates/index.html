@@ -991,7 +991,10 @@
             <div class="field-grid-2">
               <div><label class="field-label">Bot Token</label><input type="password" :value="vars.TELEGRAM_BOT_TOKEN||''" @input="vars.TELEGRAM_BOT_TOKEN=$event.target.value" placeholder="From @BotFather"></div>
               <div><label class="field-label">Allowed User IDs</label><input type="text" :value="vars.TELEGRAM_ALLOWED_USERS||''" @input="vars.TELEGRAM_ALLOWED_USERS=$event.target.value" placeholder="123456,789012"><p class="hint">Use <code>*</code> to allow all users</p></div>
+              <div><label class="field-label">Webhook URL</label><input type="text" :value="vars.TELEGRAM_WEBHOOK_URL||''" @input="vars.TELEGRAM_WEBHOOK_URL=$event.target.value" placeholder="Auto-filled on Railway"><p class="hint">Railway default: <code>https://&lt;your Railway domain&gt;/telegram</code></p></div>
+              <div><label class="field-label">Webhook Secret</label><input type="password" :value="vars.TELEGRAM_WEBHOOK_SECRET||''" @input="vars.TELEGRAM_WEBHOOK_SECRET=$event.target.value" placeholder="Auto-generated"><p class="hint">Required by Hermes webhook mode; generated when left blank</p></div>
             </div>
+            <p class="hint" style="margin-top:8px;">Telegram uses webhook mode by default on Railway, so the service can sleep between inbound messages instead of polling continuously.</p>
           </div>
 
           <!-- Discord -->
@@ -1532,7 +1535,7 @@ function app() {
 
     clearChannel(ch) {
       const keysMap = {
-        telegram:   ['TELEGRAM_BOT_TOKEN','TELEGRAM_ALLOWED_USERS'],
+        telegram:   ['TELEGRAM_BOT_TOKEN','TELEGRAM_ALLOWED_USERS','TELEGRAM_WEBHOOK_URL','TELEGRAM_WEBHOOK_SECRET','TELEGRAM_WEBHOOK_PORT'],
         discord:    ['DISCORD_BOT_TOKEN','DISCORD_ALLOWED_USERS'],
         slack:      ['SLACK_BOT_TOKEN','SLACK_APP_TOKEN'],
         email:      ['EMAIL_ADDRESS','EMAIL_PASSWORD','EMAIL_IMAP_HOST','EMAIL_SMTP_HOST'],
