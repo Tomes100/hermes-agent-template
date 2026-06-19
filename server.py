@@ -296,7 +296,8 @@ def write_config_yaml(data: dict[str, str]) -> None:
 
     # Deployment-managed (always authoritative — these reflect the runtime env).
     merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
-    merged_model["default"] = model
+    if model:
+        merged_model["default"] = model
     # Only force provider="auto" when a known API key is configured. If no
     # API key is set, the user likely configured an OAuth provider (xai-oauth,
     # qwen-oauth, etc.) via the dashboard's model picker — preserve that value
@@ -386,6 +387,30 @@ _XAI_TOKEN_URL   = "https://auth.x.ai/oauth2/token"
 _XAI_GRANT_TYPE  = "urn:ietf:params:oauth:grant-type:device_code"
 
 _xai_oauth_state: dict | None = None  # one auth at a time (single-user deployment)
+
+
+def _has_any_oauth_tokens() -> bool:
+    """True when auth.json contains OAuth tokens for any Hermes provider."""
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    if not auth_path.exists():
+        return False
+    try:
+        data = json.loads(auth_path.read_text())
+        providers = data.get("providers", {})
+        if not isinstance(providers, dict):
+            return False
+
+        for provider_data in providers.values():
+            if not isinstance(provider_data, dict):
+                continue
+            tokens = provider_data.get("tokens", {})
+            if isinstance(tokens, dict) and (
+                tokens.get("refresh_token") or tokens.get("access_token")
+            ):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _has_xai_oauth_tokens() -> bool:
@@ -628,7 +653,7 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     if data is None:
         data = read_env(ENV_FILE)
     has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_xai_oauth_tokens()
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_any_oauth_tokens()
     return has_model and has_provider
 
 
