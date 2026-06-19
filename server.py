@@ -29,6 +29,7 @@ injected into every proxied HTML response so users can always return to the wiza
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -72,6 +73,10 @@ HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 # so /telegram is forwarded to the gateway's local webhook listener below.
 TELEGRAM_WEBHOOK_HOST = "127.0.0.1"
 TELEGRAM_WEBHOOK_DEFAULT_PORT = 8443
+TELEGRAM_WEBHOOK_QUEUE_DIR = Path(HERMES_HOME) / "telegram-webhook-queue"
+TELEGRAM_WEBHOOK_INLINE_WAIT = float(os.environ.get("TELEGRAM_WEBHOOK_INLINE_WAIT", "8"))
+TELEGRAM_WEBHOOK_REPLAY_MAX_SECONDS = float(os.environ.get("TELEGRAM_WEBHOOK_REPLAY_MAX_SECONDS", "120"))
+TELEGRAM_WEBHOOK_MAX_AGE_SECONDS = float(os.environ.get("TELEGRAM_WEBHOOK_MAX_AGE_SECONDS", "86400"))
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -413,6 +418,25 @@ def _has_any_oauth_tokens() -> bool:
         return False
 
 
+def _configured_model_default() -> str:
+    """Return model.default from config.yaml, if the dashboard wrote one."""
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    if not config_path.exists():
+        return ""
+    try:
+        import yaml
+        with config_path.open() as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            return ""
+        model = loaded.get("model", {})
+        if not isinstance(model, dict):
+            return ""
+        return str(model.get("default") or "").strip()
+    except Exception:
+        return ""
+
+
 def _has_xai_oauth_tokens() -> bool:
     """True when auth.json contains a valid xAI OAuth refresh token."""
     auth_path = Path(HERMES_HOME) / "auth.json"
@@ -652,9 +676,13 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """
     if data is None:
         data = read_env(ENV_FILE)
-    has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_any_oauth_tokens()
-    return has_model and has_provider
+    has_model = bool(data.get("LLM_MODEL") or _configured_model_default())
+    has_oauth_provider = _has_any_oauth_tokens()
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or has_oauth_provider
+    # OAuth providers such as OpenAI Codex can supply a Hermes-side default model.
+    # Do not block cold-start just because the dashboard did not mirror a model
+    # into .env; the gateway can start and resolve/provider-default the model.
+    return has_provider and (has_model or has_oauth_provider)
 
 
 def mask(data: dict[str, str]) -> dict[str, str]:
@@ -853,38 +881,40 @@ class Gateway:
         self.logs: deque[str] = deque(maxlen=500)
         self.started_at: float | None = None
         self.restarts = 0
+        self._start_lock = asyncio.Lock()
 
     async def start(self):
-        if self.proc and self.proc.returncode is None:
-            return
-        self.state = "starting"
-        try:
-            # .env values take priority over Railway env vars.
-            # We build the env this way so hermes's own dotenv loading
-            # (which reads the same file) doesn't shadow our values.
-            env = {**os.environ, "HERMES_HOME": HERMES_HOME}
-            file_env = read_env(ENV_FILE)
-            merged_env = apply_telegram_webhook_defaults(dict(file_env))
-            if merged_env != file_env:
-                write_env(ENV_FILE, merged_env)
-            env.update(merged_env)
-            model = env.get("LLM_MODEL", "")
-            provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
-            print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
-            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(merged_env)
-            self.proc = await asyncio.create_subprocess_exec(
-                "hermes", "gateway",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            self.state = "running"
-            self.started_at = time.time()
-            asyncio.create_task(self._drain())
-        except Exception as e:
-            self.state = "error"
-            self.logs.append(f"[error] Failed to start: {e}")
+        async with self._start_lock:
+            if self.proc and self.proc.returncode is None:
+                return
+            self.state = "starting"
+            try:
+                # .env values take priority over Railway env vars.
+                # We build the env this way so hermes's own dotenv loading
+                # (which reads the same file) doesn't shadow our values.
+                env = {**os.environ, "HERMES_HOME": HERMES_HOME}
+                file_env = read_env(ENV_FILE)
+                merged_env = apply_telegram_webhook_defaults(dict(file_env))
+                if merged_env != file_env:
+                    write_env(ENV_FILE, merged_env)
+                env.update(merged_env)
+                model = env.get("LLM_MODEL", "")
+                provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
+                print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
+                # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
+                write_config_yaml(merged_env)
+                self.proc = await asyncio.create_subprocess_exec(
+                    "hermes", "gateway",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                )
+                self.state = "running"
+                self.started_at = time.time()
+                asyncio.create_task(self._drain())
+            except Exception as e:
+                self.state = "error"
+                self.logs.append(f"[error] Failed to start: {e}")
 
     async def stop(self):
         if not self.proc or self.proc.returncode is not None:
@@ -1254,6 +1284,137 @@ It may still be starting up, or it may have crashed.</p>
 </body></html>""" % HERMES_DASHBOARD_PORT
 
 
+_telegram_replay_task: asyncio.Task | None = None
+
+
+def _telegram_webhook_target(env: dict[str, str], path: str = "/telegram", query: str = "") -> str:
+    port = _telegram_webhook_port(env)
+    target = f"http://{TELEGRAM_WEBHOOK_HOST}:{port}{path}"
+    if query:
+        target = f"{target}?{query}"
+    return target
+
+
+async def _ensure_gateway_started_for_webhook(env: dict[str, str]) -> bool:
+    """Start the gateway on-demand for a Telegram webhook wake-up request."""
+    if not is_config_complete(env):
+        print("[telegram-webhook] config incomplete; cannot start gateway for webhook", flush=True)
+        return False
+    if not (gw.proc and gw.proc.returncode is None):
+        print("[telegram-webhook] gateway not running; starting for webhook wake-up", flush=True)
+        await gw.start()
+    return bool(gw.proc and gw.proc.returncode is None)
+
+
+async def _forward_telegram_webhook(
+    method: str,
+    target: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> httpx.Response:
+    return await get_http_client().request(
+        method,
+        target,
+        headers=headers,
+        content=body,
+        timeout=httpx.Timeout(10.0, connect=1.0),
+    )
+
+
+def _queue_telegram_webhook(
+    method: str,
+    path: str,
+    query: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> Path:
+    TELEGRAM_WEBHOOK_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "created_at": time.time(),
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": headers,
+        "body_b64": base64.b64encode(body).decode("ascii"),
+    }
+    queue_path = TELEGRAM_WEBHOOK_QUEUE_DIR / f"{int(time.time() * 1000)}-{secrets.token_hex(6)}.json"
+    queue_path.write_text(json.dumps(payload, separators=(",", ":")))
+    try:
+        queue_path.chmod(0o600)
+    except Exception:
+        pass
+    print(f"[telegram-webhook] queued update while gateway starts: {queue_path.name}", flush=True)
+    return queue_path
+
+
+def _schedule_telegram_webhook_replay() -> None:
+    global _telegram_replay_task
+    if _telegram_replay_task is None or _telegram_replay_task.done():
+        _telegram_replay_task = asyncio.create_task(_replay_queued_telegram_webhooks())
+
+
+async def _replay_queued_telegram_webhooks() -> None:
+    """Drain persisted Telegram updates that arrived before the gateway listener was ready."""
+    global _telegram_replay_task
+    deadline = time.time() + TELEGRAM_WEBHOOK_REPLAY_MAX_SECONDS
+    try:
+        while time.time() < deadline:
+            files = sorted(TELEGRAM_WEBHOOK_QUEUE_DIR.glob("*.json")) if TELEGRAM_WEBHOOK_QUEUE_DIR.exists() else []
+            if not files:
+                return
+
+            env = read_env(ENV_FILE)
+            if not await _ensure_gateway_started_for_webhook(env):
+                return
+
+            made_progress = False
+            for queue_path in files:
+                try:
+                    payload = json.loads(queue_path.read_text())
+                    age = time.time() - float(payload.get("created_at", 0))
+                    if age > TELEGRAM_WEBHOOK_MAX_AGE_SECONDS:
+                        queue_path.unlink(missing_ok=True)
+                        print(f"[telegram-webhook] dropped stale queued update: {queue_path.name}", flush=True)
+                        made_progress = True
+                        continue
+
+                    body = base64.b64decode(payload.get("body_b64", ""))
+                    target = _telegram_webhook_target(
+                        env,
+                        str(payload.get("path") or "/telegram"),
+                        str(payload.get("query") or ""),
+                    )
+                    upstream = await _forward_telegram_webhook(
+                        str(payload.get("method") or "POST"),
+                        target,
+                        dict(payload.get("headers") or {}),
+                        body,
+                    )
+                    if upstream.status_code < 500:
+                        queue_path.unlink(missing_ok=True)
+                        print(f"[telegram-webhook] replayed queued update: {queue_path.name}", flush=True)
+                        made_progress = True
+                    else:
+                        print(
+                            f"[telegram-webhook] replay got {upstream.status_code}; will retry: {queue_path.name}",
+                            flush=True,
+                        )
+                        break
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    break
+                except Exception as e:
+                    print(f"[telegram-webhook] dropping invalid queued update {queue_path.name}: {e!r}", flush=True)
+                    queue_path.unlink(missing_ok=True)
+                    made_progress = True
+
+            if not made_progress:
+                await asyncio.sleep(1.0)
+    finally:
+        _telegram_replay_task = None
+        if TELEGRAM_WEBHOOK_QUEUE_DIR.exists() and any(TELEGRAM_WEBHOOK_QUEUE_DIR.glob("*.json")):
+            print("[telegram-webhook] queued updates remain; replay will resume on next webhook/start", flush=True)
+
+
 async def route_telegram_webhook(request: Request) -> Response:
     """Public Telegram webhook ingress.
 
@@ -1264,28 +1425,33 @@ async def route_telegram_webhook(request: Request) -> Response:
     X-Telegram-Bot-Api-Secret-Token against TELEGRAM_WEBHOOK_SECRET.
     """
     env = read_env(ENV_FILE)
-    port = _telegram_webhook_port(env)
-    target = f"http://{TELEGRAM_WEBHOOK_HOST}:{port}{request.url.path}"
-    if request.url.query:
-        target = f"{target}?{request.url.query}"
+    target = _telegram_webhook_target(env, request.url.path, request.url.query)
 
     req_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP
     }
     body = await request.body()
-    try:
-        upstream = await get_http_client().request(
-            request.method,
-            target,
-            headers=req_headers,
-            content=body,
-        )
-    except (httpx.ConnectError, httpx.ConnectTimeout):
-        return Response("Telegram webhook listener is not ready", status_code=503, media_type="text/plain")
-    except httpx.RequestError as e:
-        print(f"[telegram-webhook] upstream error for {request.method} {request.url.path}: {e}", flush=True)
-        return Response("Telegram webhook proxy error", status_code=502, media_type="text/plain")
+
+    await _ensure_gateway_started_for_webhook(env)
+    deadline = time.time() + TELEGRAM_WEBHOOK_INLINE_WAIT
+    while True:
+        try:
+            upstream = await _forward_telegram_webhook(request.method, target, req_headers, body)
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if time.time() >= deadline:
+                _queue_telegram_webhook(request.method, request.url.path, request.url.query, req_headers, body)
+                _schedule_telegram_webhook_replay()
+                # ACK Telegram: the update is persisted locally and will be replayed
+                # into Hermes as soon as the gateway's webhook listener opens.
+                return Response("Telegram webhook queued while gateway starts", status_code=200, media_type="text/plain")
+            await asyncio.sleep(0.5)
+        except httpx.RequestError as e:
+            print(f"[telegram-webhook] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+            _queue_telegram_webhook(request.method, request.url.path, request.url.query, req_headers, body)
+            _schedule_telegram_webhook_replay()
+            return Response("Telegram webhook queued after proxy error", status_code=200, media_type="text/plain")
 
     resp_headers = {
         k: v for k, v in upstream.headers.items()
@@ -1409,6 +1575,8 @@ async def lifespan(app):
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
     await auto_start()
+    if TELEGRAM_WEBHOOK_QUEUE_DIR.exists() and any(TELEGRAM_WEBHOOK_QUEUE_DIR.glob("*.json")):
+        _schedule_telegram_webhook_replay()
     try:
         yield
     finally:
