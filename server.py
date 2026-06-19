@@ -67,6 +67,7 @@ PAIRING_TTL = 3600
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+HERMES_DASHBOARD_INLINE_WAIT = float(os.environ.get("HERMES_DASHBOARD_INLINE_WAIT", "8"))
 
 # Telegram webhook mode — Hermes listens on this internal port when
 # TELEGRAM_WEBHOOK_URL is set. Railway exposes only this admin server publicly,
@@ -976,33 +977,42 @@ class Dashboard:
         self.proc: asyncio.subprocess.Process | None = None
         self.logs: deque[str] = deque(maxlen=300)
         self._drain_task: asyncio.Task | None = None
+        self._start_lock = asyncio.Lock()
+        self.started_at: float | None = None
+        self.restarts = 0
 
     async def start(self):
-        if self.proc and self.proc.returncode is None:
-            return
-        try:
-            self.proc = await asyncio.create_subprocess_exec(
-                "hermes", "dashboard",
-                "--host", HERMES_DASHBOARD_HOST,
-                "--port", str(HERMES_DASHBOARD_PORT),
-                "--no-open",
-                # --skip-build: the Dockerfile pre-builds the React dashboard
-                # into hermes_cli/web_dist/ at image time. This flag tells
-                # hermes to trust that dist and skip its npm build check,
-                # which would otherwise add ~30s to first startup (hermes >= v2026.5.16).
-                "--skip-build",
-                # v2026.6.5 removed the dashboard-level --tui flag: the
-                # embedded Chat tab and its /api/pty + /api/ws + /api/events
-                # sockets are now always enabled by `hermes dashboard`.
-                # Passing --tui here makes argparse exit before the server
-                # binds, leaving the Railway proxy with no dashboard.
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
-            self._drain_task = asyncio.create_task(self._drain())
-        except Exception as e:
-            print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
+        async with self._start_lock:
+            if self.proc and self.proc.returncode is None:
+                return
+            if self.proc and self.proc.returncode is not None:
+                print(f"[dashboard] previous process exited with code {self.proc.returncode}; respawning", flush=True)
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    "hermes", "dashboard",
+                    "--host", HERMES_DASHBOARD_HOST,
+                    "--port", str(HERMES_DASHBOARD_PORT),
+                    "--no-open",
+                    # --skip-build: the Dockerfile pre-builds the React dashboard
+                    # into hermes_cli/web_dist/ at image time. This flag tells
+                    # hermes to trust that dist and skip its npm build check,
+                    # which would otherwise add ~30s to first startup (hermes >= v2026.5.16).
+                    "--skip-build",
+                    # v2026.6.5 removed the dashboard-level --tui flag: the
+                    # embedded Chat tab and its /api/pty + /api/ws + /api/events
+                    # sockets are now always enabled by `hermes dashboard`.
+                    # Passing --tui here makes argparse exit before the server
+                    # binds, leaving the Railway proxy with no dashboard.
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                self.started_at = time.time()
+                print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
+                self._drain_task = asyncio.create_task(self._drain())
+            except Exception as e:
+                self.proc = None
+                self.started_at = None
+                print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
 
     async def _drain(self):
         """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
@@ -1016,13 +1026,16 @@ class Dashboard:
             print(f"[dashboard] drain error: {e!r}", flush=True)
         finally:
             rc = self.proc.returncode if self.proc else None
+            if rc is not None:
+                self.started_at = None
             if rc is not None and rc != 0:
-                print(f"[dashboard] EXITED with code {rc} — reverse proxy will return 503 until restart", flush=True)
+                print(f"[dashboard] EXITED with code {rc} — reverse proxy will restart it on demand", flush=True)
             elif rc == 0:
                 print(f"[dashboard] exited cleanly (code 0)", flush=True)
 
     async def stop(self):
         if not self.proc or self.proc.returncode is not None:
+            self.started_at = None
             return
         self.proc.terminate()
         try:
@@ -1030,6 +1043,23 @@ class Dashboard:
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
+        self.started_at = None
+
+    async def restart(self):
+        await self.stop()
+        self.restarts += 1
+        await self.start()
+
+    def status(self) -> dict:
+        proc = self.proc
+        running = bool(proc and proc.returncode is None)
+        uptime = int(time.time() - self.started_at) if running and self.started_at else None
+        return {
+            "state": "running" if running else "stopped",
+            "pid": proc.pid if running and proc else None,
+            "uptime": uptime,
+            "restarts": self.restarts,
+        }
 
 
 dash = Dashboard()
@@ -1056,7 +1086,7 @@ async def page_index(request: Request):
 
 
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state})
+    return JSONResponse({"status": "ok", "gateway": gw.state, "dashboard": dash.status()})
 
 
 async def api_config_get(request: Request):
@@ -1104,12 +1134,16 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
-    return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
+    return JSONResponse({"gateway": gw.status(), "dashboard": dash.status(), "providers": providers, "channels": channels})
 
 
 async def api_logs(request: Request):
     if err := guard(request): return err
-    return JSONResponse({"lines": list(gw.logs)})
+    lines = list(gw.logs)
+    if dash.logs:
+        lines.append("--- dashboard ---")
+        lines.extend(list(dash.logs))
+    return JSONResponse({"lines": lines})
 
 
 async def api_gw_start(request: Request):
@@ -1465,13 +1499,36 @@ async def route_telegram_webhook(request: Request) -> Response:
     )
 
 
+async def _ensure_dashboard_started() -> bool:
+    """Make dashboard availability self-healing after Railway sleep or child exit."""
+    if dash.proc and dash.proc.returncode is None:
+        return True
+    print("[dashboard] not running; starting on-demand for proxy request", flush=True)
+    await dash.start()
+    return bool(dash.proc and dash.proc.returncode is None)
+
+
+async def _request_dashboard(
+    method: str,
+    target: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> httpx.Response:
+    return await get_http_client().request(
+        method,
+        target,
+        headers=headers,
+        content=body,
+        timeout=httpx.Timeout(30.0, connect=1.0),
+    )
+
+
 async def _proxy_to_dashboard(request: Request) -> Response:
     """Forward an authenticated request to the Hermes dashboard subprocess.
 
     Assumes edge auth (basic auth middleware) has already validated the caller.
     HTTP-only: the native Hermes dashboard does not use WebSockets.
     """
-    client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
     if request.url.query:
         target = f"{target}?{request.url.query}"
@@ -1482,18 +1539,23 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     }
     body = await request.body()
 
-    try:
-        upstream = await client.request(
-            request.method,
-            target,
-            headers=req_headers,
-            content=body,
-        )
-    except (httpx.ConnectError, httpx.ConnectTimeout):
-        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
-    except httpx.RequestError as e:
-        print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
-        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
+    await _ensure_dashboard_started()
+    deadline = time.time() + HERMES_DASHBOARD_INLINE_WAIT
+    while True:
+        try:
+            upstream = await _request_dashboard(request.method, target, req_headers, body)
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # The dashboard subprocess may be running but not bound yet, or it
+            # may have just exited between the process check and connect.
+            if not (dash.proc and dash.proc.returncode is None):
+                await _ensure_dashboard_started()
+            if time.time() >= deadline:
+                return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
+            await asyncio.sleep(0.5)
+        except httpx.RequestError as e:
+            print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+            return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
 
     # Surface non-2xx responses from hermes into Railway logs so we can
     # diagnose 401/500s without needing browser DevTools access.
@@ -1693,21 +1755,29 @@ async def ws_proxy(websocket: WebSocket) -> None:
     if qs:
         upstream_url = f"{upstream_url}?{qs}"
 
-    try:
-        upstream = await websockets.connect(
-            upstream_url,
-            open_timeout=5,
-            # Don't forward client cookies/headers — hermes WS auth is
-            # purely token-based via the URL, and forwarding random
-            # headers risks future upstream surprises.
-        )
-    except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
-        # Hermes dashboard down, restarting, or rejected the upgrade
-        # (e.g. bad/missing session token).
-        print(f"[ws-proxy] upstream connect failed for {path}: {e!r}", flush=True)
-        # 1011 = internal error; client SPA will surface a generic close.
-        await websocket.close(code=1011)
-        return
+    await _ensure_dashboard_started()
+    deadline = time.time() + HERMES_DASHBOARD_INLINE_WAIT
+    while True:
+        try:
+            upstream = await websockets.connect(
+                upstream_url,
+                open_timeout=2,
+                # Don't forward client cookies/headers — hermes WS auth is
+                # purely token-based via the URL, and forwarding random
+                # headers risks future upstream surprises.
+            )
+            break
+        except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
+            # Hermes dashboard down, restarting, or rejected the upgrade
+            # (e.g. bad/missing session token). Retry briefly for cold starts.
+            if not (dash.proc and dash.proc.returncode is None):
+                await _ensure_dashboard_started()
+            if time.time() >= deadline:
+                print(f"[ws-proxy] upstream connect failed for {path}: {e!r}", flush=True)
+                # 1011 = internal error; client SPA will surface a generic close.
+                await websocket.close(code=1011)
+                return
+            await asyncio.sleep(0.5)
 
     # 3. Both sides ready — accept and start pumping.
     await websocket.accept()
