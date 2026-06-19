@@ -85,6 +85,12 @@ ENV HERMES_TUI_DIR=/opt/hermes-agent/ui-tui
 # project-root detection changes again.
 ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 
+# TEMP DEBUG DEFAULT: Railway's own sleep timer is fixed (~10 min), so this
+# simulates sleep of Hermes child processes after 60s idle. Set the Railway
+# variable HERMES_DEBUG_CHILD_IDLE_STOP_SECONDS=0 or remove this line after
+# debugging.
+ENV HERMES_DEBUG_CHILD_IDLE_STOP_SECONDS=60
+
 # tini wraps start.sh so it runs as PID 1's child instead of as PID 1 itself.
 # `-g` propagates signals to the whole process group so `docker stop` /
 # Railway's SIGTERM cleanly terminates the entire tree, not just start.sh.

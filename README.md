@@ -72,6 +72,7 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `TELEGRAM_WEBHOOK_URL` | *(auto-filled on Railway)* | Public Telegram webhook endpoint, usually `https://<your Railway domain>/telegram` |
 | `TELEGRAM_WEBHOOK_SECRET` | *(auto-generated)* | Secret token Telegram echoes on webhook calls; required by Hermes webhook mode |
 | `TELEGRAM_WEBHOOK_PORT` | `8443` | Internal Hermes webhook listener port; the template proxies public `/telegram` traffic to it |
+| `HERMES_DEBUG_CHILD_IDLE_STOP_SECONDS` | `60` in this debug fork | Debug only. When positive, stops `hermes gateway` and `hermes dashboard` after this many seconds without non-health HTTP traffic so restart/wake logic can be tested without waiting for Railway's fixed idle-sleep window. Set to `0` after debugging. |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
 

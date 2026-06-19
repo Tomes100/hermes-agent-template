@@ -44,6 +44,7 @@ import httpx
 import websockets
 import websockets.exceptions
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -78,6 +79,16 @@ TELEGRAM_WEBHOOK_QUEUE_DIR = Path(HERMES_HOME) / "telegram-webhook-queue"
 TELEGRAM_WEBHOOK_INLINE_WAIT = float(os.environ.get("TELEGRAM_WEBHOOK_INLINE_WAIT", "8"))
 TELEGRAM_WEBHOOK_REPLAY_MAX_SECONDS = float(os.environ.get("TELEGRAM_WEBHOOK_REPLAY_MAX_SECONDS", "120"))
 TELEGRAM_WEBHOOK_MAX_AGE_SECONDS = float(os.environ.get("TELEGRAM_WEBHOOK_MAX_AGE_SECONDS", "86400"))
+
+# Debug-only child sleep simulation. Railway's actual platform idle sleep delay
+# is fixed (~10 minutes) and cannot be lowered in railway.toml. When this env
+# var is set to a positive number, the admin web process stays awake but stops
+# the managed Hermes child processes after that many seconds without user
+# traffic. This lets wake/restart behavior be tested quickly without making the
+# deployment exit/crash.
+DEBUG_CHILD_IDLE_STOP_SECONDS = float(os.environ.get("HERMES_DEBUG_CHILD_IDLE_STOP_SECONDS", "0") or "0")
+DEBUG_IDLE_IGNORED_PATHS = {"/health"}
+_debug_last_activity = time.time()
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -1085,8 +1096,23 @@ async def page_index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
+def _debug_idle_status() -> dict:
+    enabled = DEBUG_CHILD_IDLE_STOP_SECONDS > 0
+    return {
+        "enabled": enabled,
+        "seconds": DEBUG_CHILD_IDLE_STOP_SECONDS if enabled else None,
+        "idle_for": int(time.time() - _debug_last_activity) if enabled else None,
+        "note": "stops child processes only; Railway platform sleep remains fixed" if enabled else None,
+    }
+
+
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state, "dashboard": dash.status()})
+    return JSONResponse({
+        "status": "ok",
+        "gateway": gw.state,
+        "dashboard": dash.status(),
+        "debug_idle": _debug_idle_status(),
+    })
 
 
 async def api_config_get(request: Request):
@@ -1134,7 +1160,13 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
-    return JSONResponse({"gateway": gw.status(), "dashboard": dash.status(), "providers": providers, "channels": channels})
+    return JSONResponse({
+        "gateway": gw.status(),
+        "dashboard": dash.status(),
+        "debug_idle": _debug_idle_status(),
+        "providers": providers,
+        "channels": channels,
+    })
 
 
 async def api_logs(request: Request):
@@ -1624,6 +1656,67 @@ async def route_setup_404(request: Request) -> Response:
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
+def _debug_touch_idle_activity(path: str) -> None:
+    """Record user traffic for the debug-only child idle-stop loop."""
+    global _debug_last_activity
+    if DEBUG_CHILD_IDLE_STOP_SECONDS <= 0:
+        return
+    if path in DEBUG_IDLE_IGNORED_PATHS:
+        return
+    _debug_last_activity = time.time()
+
+
+class DebugIdleActivityMiddleware(BaseHTTPMiddleware):
+    """Track HTTP activity without counting Railway health checks."""
+
+    async def dispatch(self, request: Request, call_next):
+        _debug_touch_idle_activity(request.url.path)
+        return await call_next(request)
+
+
+async def _debug_child_idle_stop_loop():
+    """Stop Hermes child processes after a configurable idle window.
+
+    This is intentionally not a process exit. Exiting the main Railway process
+    is not equivalent to Railway platform sleep and can leave the deployment in
+    a stopped/failed state instead of giving us a clean wake test.
+    """
+    global _debug_last_activity
+    if DEBUG_CHILD_IDLE_STOP_SECONDS <= 0:
+        return
+    print(
+        f"[debug-idle] enabled: stopping Hermes child processes after "
+        f"{DEBUG_CHILD_IDLE_STOP_SECONDS:g}s without user traffic",
+        flush=True,
+    )
+    poll_interval = max(1.0, min(15.0, DEBUG_CHILD_IDLE_STOP_SECONDS / 4))
+    while True:
+        await asyncio.sleep(poll_interval)
+        idle_for = time.time() - _debug_last_activity
+        if idle_for < DEBUG_CHILD_IDLE_STOP_SECONDS:
+            continue
+
+        stopped: list[str] = []
+        if gw.proc and gw.proc.returncode is None:
+            await gw.stop()
+            stopped.append("gateway")
+        if dash.proc and dash.proc.returncode is None:
+            await dash.stop()
+            stopped.append("dashboard")
+
+        if stopped:
+            print(
+                f"[debug-idle] stopped {', '.join(stopped)} after "
+                f"{int(idle_for)}s idle; next /telegram or dashboard request "
+                "should restart what it needs",
+                flush=True,
+            )
+
+        # Avoid logging/stopping repeatedly while already idle. The next real
+        # request will move this timestamp forward via the middleware.
+        _debug_last_activity = time.time()
+
+
 async def auto_start():
     if is_config_complete():
         asyncio.create_task(gw.start())
@@ -1637,6 +1730,8 @@ async def lifespan(app):
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
     await auto_start()
+    if DEBUG_CHILD_IDLE_STOP_SECONDS > 0:
+        asyncio.create_task(_debug_child_idle_stop_loop())
     if TELEGRAM_WEBHOOK_QUEUE_DIR.exists() and any(TELEGRAM_WEBHOOK_QUEUE_DIR.glob("*.json")):
         _schedule_telegram_webhook_replay()
     try:
@@ -1866,9 +1961,11 @@ routes = [
     Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
 ]
 
-# No middleware — auth is enforced per-handler via guard(). This keeps /health
-# and /login truly unauthenticated without middleware gymnastics.
+# Auth is enforced per-handler via guard(). /health and /login stay unauthenticated;
+# the optional debug middleware only tracks activity for child idle-stop testing.
 app = Starlette(routes=routes, lifespan=lifespan)
+if DEBUG_CHILD_IDLE_STOP_SECONDS > 0:
+    app.add_middleware(DebugIdleActivityMiddleware)
 
 if __name__ == "__main__":
     import uvicorn
